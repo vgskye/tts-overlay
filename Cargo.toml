@@ -1,0 +1,17 @@
+[package]
+name = "tts-overlay"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64 = "0.21.5"
+eframe = "0.24.1"
+env_logger = "0.10.1"
+oneshot = "0.1.6"
+reqwest = { version = "0.11.23", features = ["blocking", "json"] }
+rodio = "0.17.3"
+serde = { version = "1.0.194", features = ["derive"] }
+serde_json = "1.0.110"
+toml = "0.8.8"
