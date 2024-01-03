@@ -1,26 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use std::{
-    fs,
-    io::Cursor,
-    thread::{self, sleep},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+use std::{fs, io::Cursor, thread::sleep};
 
 use base64::Engine;
-use eframe::{
-    egui::{self, Frame, TextEdit},
-    epaint::{ahash::HashMap, Color32, FontId},
-};
+use color_eyre::eyre::{eyre, Context as _, Result};
+use eframe::egui::{self, Frame, TextEdit, Ui};
+use eframe::epaint::ahash::HashMap;
+use eframe::epaint::{Color32, FontId};
 use reqwest::header::ACCEPT;
-use rodio::{cpal::traits::HostTrait, DeviceTrait, Source};
+use rodio::cpal::traits::HostTrait;
+use rodio::{Decoder, DeviceTrait, OutputStreamHandle, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-fn main() -> Result<(), eframe::Error> {
+const SYNTHESIZE_ENDPOINT: &str = "https://texttospeech.googleapis.com/v1/text:synthesize";
+const CONFIG_FILE: &str = "config.toml";
+
+type SynthesizeResponse = HashMap<String, String>;
+
+fn main() -> Result<()> {
+    color_eyre::install()?;
     env_logger::init();
-    let config: Configuration =
-        toml::from_str(&fs::read_to_string("config.toml").unwrap()).unwrap();
+
+    let config_file = fs::read_to_string(CONFIG_FILE)?;
+    let config: Configuration = toml::from_str(&config_file)?;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([config.width, 1.0])
@@ -31,13 +36,16 @@ fn main() -> Result<(), eframe::Error> {
             .with_transparent(true),
         ..Default::default()
     };
+
     let (send, recv) = oneshot::channel();
-    eframe::run_native(
+
+    let _ = eframe::run_native(
         "TTS Overlay",
         options,
         Box::new(|_cc| Box::new(OverlayApp::new(config, send))),
-    )?;
+    );
     _ = recv.recv();
+
     Ok(())
 }
 
@@ -69,104 +77,130 @@ impl OverlayApp {
             waiter: Some(waiter),
         }
     }
+
+    fn make_synthesize_request(&self) -> Result<SynthesizeResponse> {
+        let client = reqwest::blocking::Client::new();
+        let json = json!({
+            "input": {
+                "text": self.text
+              },
+              "voice": {
+                "languageCode": self.config.gcloud_language,
+                "name": self.config.gcloud_voice
+              },
+              "audioConfig": {
+                "audioEncoding": "LINEAR16"
+              }
+        });
+
+        let req = client
+            .post(SYNTHESIZE_ENDPOINT)
+            .json(&json)
+            .header("X-goog-api-key", self.config.gcloud_token.clone())
+            .header(ACCEPT, "application/json")
+            .build()?;
+
+        let resp = client
+            .execute(req)
+            .wrap_err("Couldn't execute request to google!")?;
+        let res = resp
+            .json()
+            .wrap_err("Couldn't decode json response from google!")?;
+
+        Ok(res)
+    }
+
+    fn decode_synthesize_response(
+        &self,
+        resp: SynthesizeResponse,
+    ) -> Result<Decoder<Cursor<Vec<u8>>>> {
+        let encoded = resp
+            .get("audioContent")
+            .ok_or(eyre!("Couldn't get audiContent from Google's response!"))?;
+
+        let wav = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .wrap_err("Couldn't decode audio content!")?;
+
+        let decoder = rodio::Decoder::new_wav(Cursor::new(wav))
+            .wrap_err("Couldn't create decoder for audio content!")?;
+
+        Ok(decoder)
+    }
+
+    fn get_audo_device_handle(&self) -> Result<OutputStreamHandle> {
+        let mut output_devices = rodio::cpal::default_host()
+            .output_devices()
+            .wrap_err("Couldn't find any output devices!")?;
+
+        let found_device = output_devices
+            .find(|device| device.name().unwrap_or_default() == self.config.output_device)
+            .ok_or(eyre!(
+                "Couldn't find your configured device! Are you sure you selected the right one?"
+            ))?;
+
+        let (_, handle) = rodio::OutputStream::try_from_device(&found_device).wrap_err(format!(
+            "Couldn't created output stram for device {}!",
+            found_device.name().unwrap_or_default()
+        ))?;
+
+        Ok(handle)
+    }
+
+    fn run(&self) -> Result<()> {
+        let resp = self.make_synthesize_request()?;
+        let decoder = self.decode_synthesize_response(resp)?;
+        let output_handle = self.get_audo_device_handle()?;
+
+        let duration = decoder
+            .total_duration()
+            .unwrap_or(Duration::from_millis(25000));
+
+        output_handle
+            .play_raw(decoder.convert_samples())
+            .wrap_err("Couldn't play audio!")?;
+
+        // for good measure
+        sleep(duration + Duration::from_millis(500));
+
+        Ok(())
+    }
 }
 
 impl eframe::App for OverlayApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.; 4]
     }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default()
-            .frame(
-                Frame::central_panel(&ctx.style())
-                    .fill(Color32::TRANSPARENT)
-                    .inner_margin(4.),
-            )
-            .show(ctx, |ui| {
-                let textbox = TextEdit::singleline(&mut self.text)
-                    .hint_text("What do you want to say?")
-                    .font(FontId::proportional(24.))
-                    .desired_width(f32::INFINITY);
-                let textbox = ui.add(textbox);
-                if !textbox.has_focus() && self.grace_period <= Instant::now() {
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if let Some(waiter) = self.waiter.take() {
-                            let text = self.text.clone();
-                            let config = self.config.clone();
-                            thread::spawn(move || {
-                                let client = reqwest::blocking::Client::new();
-                                if let Ok(resp) = client
-                                    .post("https://texttospeech.googleapis.com/v1/text:synthesize")
-                                    .json(&json!({
-                                      "input": {
-                                        "text": text
-                                      },
-                                      "voice": {
-                                        "languageCode": config.gcloud_language,
-                                        "name": config.gcloud_voice
-                                      },
-                                      "audioConfig": {
-                                        "audioEncoding": "LINEAR16"
-                                      }
-                                    }))
-                                    .header("X-goog-api-key", config.gcloud_token)
-                                    .header(ACCEPT, "application/json")
-                                    .send()
-                                {
-                                    if let Ok(value) = resp.json::<HashMap<String, String>>() {
-                                        if let Some(encoded) = value.get("audioContent") {
-                                            if let Ok(wav) =
-                                                base64::engine::general_purpose::STANDARD
-                                                    .decode(encoded)
-                                            {
-                                                let host = rodio::cpal::default_host();
-                                                if let Ok(devices) = host.output_devices() {
-                                                    for device in devices {
-                                                        if let Ok(name) = device.name() {
-                                                            if name.contains(&config.output_device)
-                                                            {
-                                                                if let Ok((_, handle)) =
-                                                                    rodio::OutputStream::try_from_device(&device)
-                                                                {
-                                                                    if let Ok(decoder) =
-                                                                        rodio::Decoder::new_wav(Cursor::new(wav))
-                                                                    {
-                                                                        if let Some(duration) =
-                                                                            decoder.total_duration()
-                                                                        {
-                                                                            if let Ok(()) = handle
-                                                                                .play_raw(decoder.convert_samples())
-                                                                            {
-                                                                                // for good measure
-                                                                                sleep(
-                                                                                    duration
-                                                                                        + Duration::from_millis(
-                                                                                            500,
-                                                                                        ),
-                                                                                );
-                                                                            };
-                                                                        }
-                                                                    };
-                                                                }
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                };
-                                            }
-                                        }
-                                    }
-                                }
-                                _ = waiter.send(());
-                            });
-                        };
-                    } else if let Some(waiter) = self.waiter.take() {
+        let frame = Frame::central_panel(&ctx.style())
+            .fill(Color32::TRANSPARENT)
+            .inner_margin(4.);
+
+        let show = |ui: &mut Ui| {
+            let textbox = TextEdit::singleline(&mut self.text)
+                .hint_text("What do you want to say?")
+                .font(FontId::proportional(24.))
+                .desired_width(f32::INFINITY);
+
+            let textbox = ui.add(textbox);
+
+            if !textbox.has_focus() && self.grace_period <= Instant::now() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(waiter) = self.waiter.take() {
+                        _ = self.run();
                         _ = waiter.send(());
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close)
-                } else {
-                    textbox.request_focus();
+                    };
+                } else if let Some(waiter) = self.waiter.take() {
+                    _ = waiter.send(());
                 }
-            });
+
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+            } else {
+                textbox.request_focus();
+            };
+        };
+
+        egui::CentralPanel::default().frame(frame).show(ctx, show);
     }
 }
